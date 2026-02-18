@@ -30,6 +30,7 @@ class OutboundMessage:
     channel: str
     chat_id: str
     content: str
+    recipient_id: str | None = None  # User/entity to send the message to
     reply_to: str | None = None
     media: list[str] = field(default_factory=list)
     metadata: dict[str, Any] = field(default_factory=dict)

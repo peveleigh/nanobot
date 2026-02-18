@@ -33,7 +33,18 @@ class ChannelManager:
     
     def _init_channels(self) -> None:
         """Initialize channels based on config."""
-        
+
+        # Home Assistant channel
+        if self.config.channels.home_assistant.enabled:
+            try:
+                from nanobot.channels.ha_channel import HAChannel
+                self.channels["home_assistant"] = HAChannel(
+                    self.config.channels.home_assistant, self.bus
+                )
+                logger.info("Home Assistant channel enabled")
+            except ImportError as e:
+                logger.warning(f"Home Assistant channel not available: {e}")
+
         # Telegram channel
         if self.config.channels.telegram.enabled:
             try:

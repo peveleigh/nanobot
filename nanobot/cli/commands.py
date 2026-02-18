@@ -336,6 +336,7 @@ def gateway(
     from nanobot.cron.service import CronService
     from nanobot.cron.types import CronJob
     from nanobot.heartbeat.service import HeartbeatService
+    from nanobot.gateway.server import GatewayServer
     
     if verbose:
         import logging
@@ -384,7 +385,8 @@ def gateway(
             await bus.publish_outbound(OutboundMessage(
                 channel=job.payload.channel or "cli",
                 chat_id=job.payload.to,
-                content=response or ""
+                content=response or "",
+                recipient_id=None  # Cron jobs don't have a specific recipient
             ))
         return response
     cron.on_job = on_cron_job
@@ -404,6 +406,13 @@ def gateway(
     # Create channel manager
     channels = ChannelManager(config, bus)
     
+    # Create HTTP gateway server
+    gateway_server = GatewayServer(
+        channel_manager=channels,
+        host=config.gateway.host,
+        port=port,
+    )
+    
     if channels.enabled_channels:
         console.print(f"[green]✓[/green] Channels enabled: {', '.join(channels.enabled_channels)}")
     else:
@@ -414,6 +423,7 @@ def gateway(
         console.print(f"[green]✓[/green] Cron: {cron_status['jobs']} scheduled jobs")
     
     console.print(f"[green]✓[/green] Heartbeat: every 30m")
+    console.print(f"[green]✓[/green] HTTP Gateway: http://{config.gateway.host}:{port}")
     
     async def run():
         try:
@@ -422,6 +432,7 @@ def gateway(
             await asyncio.gather(
                 agent.run(),
                 channels.start_all(),
+                gateway_server.run_forever(),
             )
         except KeyboardInterrupt:
             console.print("\nShutting down...")
@@ -431,6 +442,7 @@ def gateway(
             cron.stop()
             agent.stop()
             await channels.stop_all()
+            await gateway_server.stop()
     
     asyncio.run(run())
 

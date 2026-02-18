@@ -83,6 +83,7 @@ class MessageTool(Tool):
             channel=channel,
             chat_id=chat_id,
             content=content,
+            recipient_id=None,  # Message tool doesn't specify recipient (broadcast to chat)
             media=media or []
         )
         
