@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -13,6 +14,17 @@ from nanobot.bus.events import OutboundMessage
 from nanobot.bus.queue import MessageBus
 
 from .base import BaseChannel
+
+
+@dataclass
+class ConversationBuffer:
+    """Buffer for messages in an active conversation."""
+    conversation_id: str
+    messages: list[str] = field(default_factory=list)
+    last_update: float = field(default_factory=time.time)
+    flush_task: asyncio.Task | None = None
+    recipient_id: str | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -33,6 +45,9 @@ class HAChannelConfig:
         allow_from: Optional list of sender IDs permitted to use this channel.
             Empty list means everyone is allowed.
         request_timeout: HTTP request timeout in seconds.
+        buffer_timeout: Seconds to wait before flushing buffered messages.
+            This allows multiple messages from a single conversation turn to be
+            combined into a single message to Home Assistant.
     """
 
     ha_url: str
@@ -44,6 +59,7 @@ class HAChannelConfig:
     poll_interval: float = 30.0
     allow_from: list[str] = field(default_factory=list)
     request_timeout: int = 30
+    buffer_timeout: float = 0.5
 
 
 class HAChannel(BaseChannel):
@@ -74,6 +90,10 @@ class HAChannel(BaseChannel):
 
         # Maps conversation_id → asyncio.Event so send() can await HA's ack.
         self._pending: dict[str, asyncio.Event] = {}
+
+        # Message buffering for HA conversation batching
+        # HA can only receive one message per user turn, so we buffer and combine
+        self._conversation_buffers: dict[str, ConversationBuffer] = {}
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -116,6 +136,9 @@ class HAChannel(BaseChannel):
         logger.info("Stopping HAChannel…")
         self._running = False
 
+        # Flush any pending message buffers before stopping
+        await self._flush_all_buffers()
+
         if self._poll_task and not self._poll_task.done():
             self._poll_task.cancel()
             try:
@@ -134,7 +157,11 @@ class HAChannel(BaseChannel):
 
     async def send(self, msg: OutboundMessage) -> None:
         """
-        Forward an agent response to the HA custom component.
+        Buffer an agent response for the HA custom component.
+
+        HA can only receive one message per user turn, so we buffer messages
+        and flush them after a short timeout to combine multiple messages
+        into a single response.
 
         The component is responsible for delivering the text to the user
         (e.g. via TTS, a lovelace notification, or an automation trigger).
@@ -146,7 +173,109 @@ class HAChannel(BaseChannel):
             logger.error("HAChannel.send() called before start().")
             return
 
-        payload = self._build_response_payload(msg)
+        conversation_id = msg.chat_id
+
+        # Add message to the conversation buffer
+        if conversation_id not in self._conversation_buffers:
+            self._conversation_buffers[conversation_id] = ConversationBuffer(
+                conversation_id=conversation_id,
+                messages=[],
+                last_update=time.time(),
+                recipient_id=msg.recipient_id,
+                metadata=msg.metadata or {},
+            )
+
+        buffer = self._conversation_buffers[conversation_id]
+        buffer.messages.append(msg.content)
+        buffer.last_update = time.time()
+        # Update recipient_id and metadata with latest values
+        if msg.recipient_id:
+            buffer.recipient_id = msg.recipient_id
+        if msg.metadata:
+            buffer.metadata = msg.metadata
+
+        logger.debug(
+            "Buffered message for HA (conversation_id={cid}, buffer_size={n})",
+            cid=conversation_id,
+            n=len(buffer.messages),
+        )
+
+        # Cancel existing flush task and schedule a new one
+        if buffer.flush_task and not buffer.flush_task.done():
+            buffer.flush_task.cancel()
+
+        buffer.flush_task = asyncio.create_task(
+            self._flush_after_timeout(conversation_id)
+        )
+
+    async def _flush_after_timeout(self, conversation_id: str) -> None:
+        """Wait for timeout, then flush buffered messages."""
+        await asyncio.sleep(self.config.buffer_timeout)
+        await self._flush_conversation(conversation_id)
+
+    async def _flush_conversation(self, conversation_id: str) -> None:
+        """Combine and send all buffered messages for a conversation."""
+        buffer = self._conversation_buffers.get(conversation_id)
+        if not buffer or not buffer.messages:
+            return
+
+        # Check if there's already a newer buffer (message arrived while we were waiting)
+        if buffer.last_update > time.time() - self.config.buffer_timeout:
+            # More messages arrived, reschedule flush
+            if not buffer.flush_task or buffer.flush_task.done():
+                buffer.flush_task = asyncio.create_task(
+                    self._flush_after_timeout(conversation_id)
+                )
+            return
+
+        # Combine messages with double newlines
+        combined_content = "\n\n".join(buffer.messages)
+
+        payload = {
+            "conversation_id": conversation_id,
+            "sender_id": buffer.recipient_id,
+            "text": combined_content,
+            "metadata": buffer.metadata,
+        }
+
+        logger.debug(
+            "Flushing buffered messages to HA (conversation_id={cid}, message_count={n})",
+            cid=conversation_id,
+            n=len(buffer.messages),
+        )
+
+        await self._send_to_ha(payload, conversation_id)
+
+        # Clean up buffer
+        del self._conversation_buffers[conversation_id]
+
+    async def _flush_all_buffers(self) -> None:
+        """Flush all pending conversation buffers. Called on shutdown."""
+        logger.info(f"Flushing {len(self._conversation_buffers)} pending conversation buffers")
+        # Cancel all pending flush tasks and flush immediately
+        for conversation_id, buffer in list(self._conversation_buffers.items()):
+            if buffer.flush_task and not buffer.flush_task.done():
+                buffer.flush_task.cancel()
+                try:
+                    await buffer.flush_task
+                except asyncio.CancelledError:
+                    pass
+
+            # Send any remaining messages immediately
+            if buffer.messages:
+                combined_content = "\n\n".join(buffer.messages)
+                payload = {
+                    "conversation_id": conversation_id,
+                    "sender_id": buffer.recipient_id,
+                    "text": combined_content,
+                    "metadata": buffer.metadata,
+                }
+                await self._send_to_ha(payload, conversation_id)
+
+        self._conversation_buffers.clear()
+
+    async def _send_to_ha(self, payload: dict[str, Any], conversation_id: str) -> None:
+        """Send a payload to the HA webhook."""
         url = self._webhook_url()
 
         logger.debug(
@@ -160,7 +289,7 @@ class HAChannel(BaseChannel):
                 resp.raise_for_status()
                 logger.info(
                     "Response delivered to HA (conversation_id={cid}, status={s})",
-                    cid=msg.chat_id,
+                    cid=conversation_id,
                     s=resp.status,
                 )
         except aiohttp.ClientResponseError as exc:

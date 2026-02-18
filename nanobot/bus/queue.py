@@ -3,8 +3,6 @@
 import asyncio
 from typing import Callable, Awaitable
 
-from loguru import logger
-
 from nanobot.bus.events import InboundMessage, OutboundMessage
 
 
@@ -62,7 +60,7 @@ class MessageBus:
                     try:
                         await callback(msg)
                     except Exception as e:
-                        logger.error(f"Error dispatching to {msg.channel}: {e}")
+                        print(f"Error dispatching to {msg.channel}: {e}")
             except asyncio.TimeoutError:
                 continue
     
