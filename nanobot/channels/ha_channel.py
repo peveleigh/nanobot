@@ -59,7 +59,7 @@ class HAChannelConfig:
     poll_interval: float = 30.0
     allow_from: list[str] = field(default_factory=list)
     request_timeout: int = 30
-    buffer_timeout: float = 0.5
+    buffer_timeout: float = 5
 
 
 class HAChannel(BaseChannel):

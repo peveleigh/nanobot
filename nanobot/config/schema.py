@@ -45,6 +45,10 @@ class HAConfig(Base):
         this channel. Empty list permits everyone.
     request_timeout:
         HTTP request timeout in seconds for calls to HA.
+    buffer_timeout:
+        Seconds to wait before flushing buffered messages.
+        This allows multiple messages from a single conversation turn to be
+        combined into a single message to Home Assistant.
     """
 
     enabled: bool = False
@@ -57,6 +61,7 @@ class HAConfig(Base):
     poll_interval: float = 30.0
     allow_from: list[str] = Field(default_factory=list)
     request_timeout: int = 30
+    buffer_timeout: float = 5
 
 class WhatsAppConfig(Base):
     """WhatsApp channel configuration."""
